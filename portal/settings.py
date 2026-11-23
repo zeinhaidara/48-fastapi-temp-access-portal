@@ -17,6 +17,9 @@ class Settings:
         }
     )
     approvers: frozenset[str] = frozenset({"lead@example.com", "sre-oncall@example.com"})
+    # Optional per-role limit, e.g. {"prod-deployer": frozenset({"lead@example.com"})}.
+    # Only the people listed can decide requests for that role; other roles use `approvers`.
+    role_approvers: dict[str, frozenset[str]] = field(default_factory=dict)
     min_duration_seconds: int = STS_MIN_SECONDS
     # One hour also matches the STS cap when the portal itself runs as a role session.
     max_duration_seconds: int = 3600
@@ -30,3 +33,11 @@ class Settings:
             raise ValueError("max_duration_seconds must be >= min_duration_seconds")
         if not self.roles or not self.approvers:
             raise ValueError("roles and approvers must not be empty")
+        unknown = set(self.role_approvers) - set(self.roles)
+        if unknown:
+            raise ValueError(f"role_approvers names unknown role(s): {sorted(unknown)}")
+        if any(not people for people in self.role_approvers.values()):
+            raise ValueError("role_approvers entries must not be empty")
+
+    def approvers_for(self, role: str) -> frozenset[str]:
+        return self.role_approvers.get(role, self.approvers)

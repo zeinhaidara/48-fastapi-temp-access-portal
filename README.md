@@ -8,7 +8,7 @@ themselves. Every decision goes to an append-only JSON-lines audit log.
 > **Status:** AWS IAM roles only. **Kubernetes namespace access is not
 > implemented.** **Authentication is not built**: the caller's identity is
 > read from an `X-Forwarded-User` header that a trusted proxy is expected to
-> set. 24 pytest tests drive the API through FastAPI's `TestClient`, with an
+> set. 30 pytest tests drive the API through FastAPI's `TestClient`, with an
 > in-memory fake granter and an injected clock. The STS granter is tested
 > against a fake STS client only. `portal/main.py` (the real entry point)
 > is not exercised by tests, and nothing has called AWS.
@@ -18,6 +18,12 @@ themselves. Every decision goes to an append-only JSON-lines audit log.
 > Implement a self-service portal backend (FastAPI / Express) that allows
 > developers to request temporary elevated IAM roles or Kubernetes namespace
 > access with automatic expiration and audit logging.
+
+Why it matters: standing admin access is the easiest thing for an attacker
+to use and the hardest to review. Access that is requested with a reason,
+approved by someone else, expires on its own, and leaves an audit trail
+gives engineers what they need for an incident without leaving it in place
+afterwards.
 
 ## Flow
 
@@ -48,7 +54,7 @@ sequenceDiagram
 | Method and path | Who | What |
 |---|---|---|
 | `POST /requests` | anyone | create a pending request |
-| `GET /requests` | anyone | approvers see all, others see their own; approved requests past expiry show `expired` |
+| `GET /requests` | anyone | approvers see requests for the roles they can decide, everyone sees their own; approved requests past expiry show `expired` |
 | `POST /requests/{id}/approve` | approvers | approve a pending request; starts the access window |
 | `POST /requests/{id}/deny` | approvers | deny a pending request |
 | `POST /requests/{id}/credentials` | the requester | issue an STS session for the time left in the window |
@@ -65,6 +71,11 @@ There is no endpoint that reads, edits or deletes the audit log, and no
   session (role chaining).
 - **Four eyes:** only listed approvers can decide, and an approver can't
   approve or deny their own request. Refusals are written to the audit log.
+- **Approvers per role:** `Settings.role_approvers` can limit a role to its
+  own approvers, for example
+  `{"prod-deployer": frozenset({"lead@example.com"})}`. Roles not listed
+  there use `Settings.approvers`. Unknown roles or empty lists are rejected
+  at startup.
 - **One decision:** only `pending` requests can be approved or denied (409
   otherwise).
 - **Expiry:** approval sets `expires_at = approved_at + duration`. Credentials
@@ -84,6 +95,13 @@ There is no endpoint that reads, edits or deletes the audit log, and no
 set of fields can be written. A test confirms that passing a credential
 field raises an error, and that the issued secret, token and key ID never
 appear in the file.
+
+Writes are safe under concurrent requests in one process: each write holds
+a lock, and the file is opened in append mode, so every line is added at the
+end in one piece. A test writes 400 large lines from 8 threads through two
+log objects and checks that every line is intact. Approve and deny also run
+under a lock, so two approvers acting at once can't both decide the same
+request.
 
 Append mode is not tamper-proof: anyone with write access to the file can
 change it. For a real audit trail, ship it to write-once storage (for
@@ -115,8 +133,13 @@ Roles, approvers, limits and the audit log path are in `portal/settings.py`
   `X-Forwarded-User`, and the service must accept traffic only from that
   proxy. As built, anyone who can reach the service can claim any identity.
 - Kubernetes namespace access is not implemented.
-- Requests live in memory and are lost on restart. A database is not built.
-- Approvers are a static list; no groups, no notifications.
+- **Single process only.** Requests live in memory and the locks are per
+  process, so run one worker (the uvicorn default). With several workers or
+  hosts, each would have its own request list and approvals would not be
+  shared. Real use needs an external store (a database) for requests and a
+  central sink for the audit log. Neither is built, and requests are lost
+  on restart.
+- Approvers are static lists in settings; no groups, no notifications.
 - Credentials can be fetched more than once within the window; each fetch is
   audited.
 - No rate limiting.
