@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import threading
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -63,6 +64,8 @@ def create_app(settings: Settings, granter: Granter, clock: Clock | None = None)
     clock = clock or (lambda: datetime.now(UTC))
     audit = AuditLog(settings.audit_log_path)
     requests: dict[str, AccessRequest] = {}  # in memory; lost on restart
+    # Sync routes run in a thread pool, so two approvers could race on one request.
+    decision_lock = threading.Lock()
     app = FastAPI(title="Temporary access portal")
 
     def identity(x_forwarded_user: str | None = Header(default=None)) -> str:
@@ -120,23 +123,29 @@ def create_app(settings: Settings, granter: Granter, clock: Clock | None = None)
     def list_requests(user: str = Depends(identity)):
         now = clock()
         visible = [
-            r for r in requests.values() if user in settings.approvers or r.requester == user
+            r
+            for r in requests.values()
+            if user in settings.approvers_for(r.role) or r.requester == user
         ]
         return [r.view(now) for r in sorted(visible, key=lambda r: r.created_at)]
 
     def decide(request_id: str, user: str, approve: bool, reason: str) -> dict:
+        with decision_lock:
+            return decide_locked(request_id, user, approve, reason)
+
+    def decide_locked(request_id: str, user: str, approve: bool, reason: str) -> dict:
         req = find(request_id)
         now = clock()
         action = "approve" if approve else "deny"
-        if user not in settings.approvers:
+        if user not in settings.approvers_for(req.role):
             audit.write(
                 now,
                 event="decision_refused",
                 request_id=req.id,
                 actor=user,
-                reason="not an approver",
+                reason="not an approver for this role",
             )
-            raise HTTPException(403, "only approvers can approve or deny")
+            raise HTTPException(403, f"only approvers for {req.role} can approve or deny")
         if user == req.requester:
             audit.write(
                 now,

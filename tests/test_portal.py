@@ -1,4 +1,5 @@
 import json
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -280,3 +281,92 @@ def test_sts_granter_passes_duration_and_source_identity():
 def test_settings_reject_sub_sts_minimum():
     with pytest.raises(ValueError):
         Settings(min_duration_seconds=60)
+
+
+# --- concurrency ---------------------------------------------------------------------------
+
+
+def test_concurrent_audit_writes_never_interleave(tmp_path):
+    # Two log objects on one file (like two app instances in one process) and lines far
+    # larger than a write buffer, so split writes would show up as broken JSON.
+    path = tmp_path / "audit.jsonl"
+    logs = [AuditLog(path), AuditLog(path)]
+    at = datetime(2026, 11, 20, 9, 0, tzinfo=UTC)
+
+    def write_many(n):
+        for i in range(50):
+            logs[n % 2].write(at, event="request_created", actor=f"u{n}", reason=f"{n}-{i}" * 4000)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(write_many, range(8)))
+
+    events = audit_events(path)
+    assert len(events) == 400
+    assert all(e["reason"] == e["reason"][: len(e["reason"]) // 4000] * 4000 for e in events)
+
+
+def test_concurrent_requests_are_all_audited(env):
+    client, _, _, audit = env
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        responses = list(pool.map(lambda _: new_request(client), range(40)))
+    assert [r.status_code for r in responses] == [201] * 40
+    events = audit_events(audit)
+    assert len(events) == 40
+    assert len({e["request_id"] for e in events}) == 40
+
+
+def test_concurrent_approvals_decide_once(tmp_path):
+    # Behaviour check: ten approvers at once, exactly one wins. The race window is too
+    # small to force reliably, so this does not prove the lock on its own.
+    clock = FakeClock()
+    approvers = frozenset(f"approver{i}@example.com" for i in range(10))
+    settings = Settings(audit_log_path=str(tmp_path / "a.jsonl"), approvers=approvers)
+    client = TestClient(create_app(settings, FakeGranter(clock), clock))
+    rid = new_request(client).json()["id"]
+
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        codes = list(
+            pool.map(
+                lambda a: client.post(f"/requests/{rid}/approve", headers=as_user(a)).status_code,
+                sorted(approvers),
+            )
+        )
+    assert sorted(codes) == [200] + [409] * 9
+    decided = [e for e in audit_events(tmp_path / "a.jsonl") if e["event"] == "request_approved"]
+    assert len(decided) == 1
+
+
+# --- per-role approvers ----------------------------------------------------------------------
+
+
+SRE = "sre-oncall@example.com"
+
+
+def test_role_approvers_limit_who_can_decide(tmp_path):
+    clock = FakeClock()
+    settings = Settings(
+        audit_log_path=str(tmp_path / "a.jsonl"),
+        role_approvers={"prod-deployer": frozenset({LEAD})},
+    )
+    client = TestClient(create_app(settings, FakeGranter(clock), clock))
+    deployer = new_request(client, role="prod-deployer").json()["id"]
+    readonly = new_request(client, role="prod-readonly").json()["id"]
+
+    r = client.post(f"/requests/{deployer}/approve", headers=as_user(SRE))
+    assert r.status_code == 403
+    assert "prod-deployer" in r.text
+    assert audit_events(tmp_path / "a.jsonl")[-1]["reason"] == "not an approver for this role"
+
+    assert client.post(f"/requests/{readonly}/approve", headers=as_user(SRE)).status_code == 200
+    assert client.post(f"/requests/{deployer}/approve", headers=as_user(LEAD)).status_code == 200
+    # SRE only sees requests for roles they can decide.
+    assert [r["id"] for r in client.get("/requests", headers=as_user(SRE)).json()] == [readonly]
+
+
+@pytest.mark.parametrize(
+    "role_approvers",
+    [{"AdministratorAccess": frozenset({LEAD})}, {"prod-deployer": frozenset()}],
+)
+def test_settings_reject_bad_role_approvers(role_approvers):
+    with pytest.raises(ValueError):
+        Settings(role_approvers=role_approvers)
